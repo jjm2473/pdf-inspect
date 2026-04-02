@@ -1,0 +1,907 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>PDF Demo</title>
+    <style>
+      :root {
+        --bg: #f5f7fa;
+        --panel: #ffffff;
+        --line: #d6dde6;
+        --text: #1c2733;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+      }
+
+      body {
+        --shell-padding: 10px;
+        --layout-gap: 12px;
+        --left-sidebar-width: 280px;
+        --right-sidebar-width: 320px;
+
+        display: flex;
+        flex-direction: column;
+        background: var(--bg);
+        color: var(--text);
+        font-family: "SF Pro Text", "Segoe UI", -apple-system, BlinkMacSystemFont, sans-serif;
+        padding: var(--shell-padding);
+      }
+
+      .chrome-header {
+        min-height: 52px;
+        border: 1px dashed #c7d1de;
+        border-radius: 12px;
+        background: rgba(255, 255, 255, 0.55);
+        overflow: hidden;
+      }
+
+      .layout {
+        flex: 1;
+        min-height: 0;
+        margin-top: 8px;
+        display: grid;
+        grid-template-columns:
+          var(--left-sidebar-width)
+          calc(
+            100vw - (var(--shell-padding) * 2) - var(--left-sidebar-width) - var(--right-sidebar-width) -
+              (var(--layout-gap) * 2)
+          )
+          var(--right-sidebar-width);
+        gap: var(--layout-gap);
+      }
+
+      .sidebar-placeholder {
+        border: 1px dashed #c7d1de;
+        border-radius: 12px;
+        background: rgba(255, 255, 255, 0.55);
+      }
+
+      .viewer-panel {
+        min-width: 0;
+        min-height: 0;
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        background: var(--panel);
+        overflow: hidden;
+        display: flex;
+        flex-direction: column;
+      }
+
+      .control-strip {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 10px 14px;
+        border-bottom: 1px solid var(--line);
+        background: var(--panel);
+      }
+
+      .open-btn {
+        appearance: none;
+        border: 1px solid #0f6cbd;
+        background: #0f6cbd;
+        color: #fff;
+        border-radius: 8px;
+        padding: 8px 12px;
+        font-weight: 600;
+		font-size: large;
+        cursor: pointer;
+      }
+
+      .hint {
+        font-size: 13px;
+        color: #5d6b7a;
+      }
+
+      .viewer-container {
+        overflow: auto;
+        height: 100%;
+        background: var(--bg);
+      }
+
+      .viewer {
+        --scale-factor: 1;
+
+        padding: 18px 0 22px;
+        display: grid;
+        justify-items: center;
+        gap: 14px;
+      }
+
+      .page {
+        --user-unit: 1;
+        --total-scale-factor: calc(var(--scale-factor) * var(--user-unit));
+        --scale-round-x: 1px;
+        --scale-round-y: 1px;
+
+        position: relative;
+        background: #fff;
+        overflow: hidden;
+        box-shadow: 0 3px 20px rgba(0, 20, 50, 0.16);
+		box-sizing: content-box;
+      }
+
+      .canvas-wrapper {
+        position: absolute;
+        inset: 0;
+        overflow: hidden;
+        z-index: 1;
+      }
+
+      .canvas-wrapper canvas {
+        position: absolute;
+        top: 0;
+        left: 0;
+        display: block;
+        width: 100%;
+        height: 100%;
+      }
+
+      .canvas-wrapper canvas.detail-view {
+        image-rendering: auto;
+      }
+
+      .text-layer {
+        position: absolute;
+        left: 0;
+        top: 0;
+        transform-origin: 0 0;
+        transform: scale(var(--total-scale-factor));
+        z-index: 5;
+        user-select: text;
+      }
+
+      .text-layer span {
+        position: absolute;
+        white-space: pre;
+        transform-origin: 0 0;
+        color: transparent;
+        cursor: text;
+      }
+
+      .text-layer span::selection {
+        color: transparent;
+        background: rgba(64, 139, 252, 0.35);
+      }
+
+      .status {
+        font-size: 13px;
+        color: #5d6b7a;
+      }
+    </style>
+  </head>
+  <body>
+    <header class="chrome-header">
+      <div class="control-strip">
+        <button id="openBtn" class="open-btn" type="button">打开 PDF</button>
+        <input id="fileInput" type="file" accept="application/pdf" hidden />
+        <span class="hint">Ctrl/Meta + 滚轮缩放；普通滚轮滚动</span>
+        <span id="status" class="status"></span>
+      </div>
+    </header>
+
+    <main class="layout">
+      <aside class="sidebar-placeholder"></aside>
+
+      <section class="viewer-panel">
+        <div id="viewerContainer" class="viewer-container">
+          <div id="viewer" class="viewer"></div>
+        </div>
+      </section>
+
+      <aside class="sidebar-placeholder"></aside>
+    </main>
+
+    <script type="module">
+      import * as pdfjsLib from "./node_modules/pdfjs-dist/build/pdf.mjs";
+
+      pdfjsLib.GlobalWorkerOptions.workerSrc = "./node_modules/pdfjs-dist/build/pdf.worker.mjs";
+
+      const MIN_SCALE = 0.1;
+      const MAX_SCALE = 25;
+      const DEFAULT_DRAWING_DELAY = 160;
+      const PIXELS_PER_LINE_SCALE = 30;
+      const BASE_MAX_RENDER_SCALE = 1.75;
+      const DETAIL_MIN_SCALE = 2.2;
+      const DETAIL_DEBOUNCE_MS = 70;
+      const TEXT_LAYER_PRELOAD_PAGES = 2;
+      const TEXT_LAYER_DEBOUNCE_MS = 80;
+
+      const openBtn = document.getElementById("openBtn");
+      const fileInput = document.getElementById("fileInput");
+      const viewerContainer = document.getElementById("viewerContainer");
+      const viewer = document.getElementById("viewer");
+      const status = document.getElementById("status");
+
+      let pdfDoc = null;
+      let pageStates = [];
+      let scale = 1;
+      let drawTimer = null;
+      let detailTimer = null;
+      let textLayerTimer = null;
+      let renderToken = 0;
+      let wheelUnusedFactor = 1;
+      let wheelUnusedTicks = 0;
+      const textMeasureCtx = document.createElement("canvas").getContext("2d");
+
+      function clamp(value, min, max) {
+        return Math.min(Math.max(value, min), max);
+      }
+
+      function setStatus(text) {
+        status.textContent = text;
+      }
+
+      function normalizeWheelEventDirection(evt) {
+        let delta = Math.hypot(evt.deltaX, evt.deltaY);
+        const angle = Math.atan2(evt.deltaY, evt.deltaX);
+        if (-0.25 * Math.PI < angle && angle < 0.75 * Math.PI) {
+          delta = -delta;
+        }
+        return delta;
+      }
+
+      function accumulateTicks(ticks) {
+        if ((wheelUnusedTicks > 0 && ticks < 0) || (wheelUnusedTicks < 0 && ticks > 0)) {
+          wheelUnusedTicks = 0;
+        }
+        wheelUnusedTicks += ticks;
+        const wholeTicks = Math.trunc(wheelUnusedTicks);
+        wheelUnusedTicks -= wholeTicks;
+        return wholeTicks;
+      }
+
+      function accumulateFactor(previousScale, factor) {
+        if (factor === 1) {
+          return 1;
+        }
+        if ((wheelUnusedFactor > 1 && factor < 1) || (wheelUnusedFactor < 1 && factor > 1)) {
+          wheelUnusedFactor = 1;
+        }
+        const newFactor = Math.floor(previousScale * factor * wheelUnusedFactor * 100) / (100 * previousScale);
+        wheelUnusedFactor = factor / newFactor;
+        return newFactor;
+      }
+
+      function clearViewer() {
+        while (viewer.firstChild) {
+          viewer.firstChild.remove();
+        }
+      }
+
+      function calcRound() {
+        const test = document.createElement("div");
+        test.style.width = "round(down, calc(1.6666666666666665 * 792px), 1px)";
+        return test.style.width === "calc(1320px)" ? Math.fround : (x) => x;
+      }
+
+      const roundForStyle = calcRound();
+
+      function setPageDimensions(pageDiv, baseWidth, baseHeight) {
+        pageDiv.style.width = `round(down, calc(var(--total-scale-factor) * ${roundForStyle(baseWidth)}px), var(--scale-round-x))`;
+        pageDiv.style.height = `round(down, calc(var(--total-scale-factor) * ${roundForStyle(baseHeight)}px), var(--scale-round-y))`;
+      }
+
+      function setViewerScale(nextScale) {
+        viewer.style.setProperty("--scale-factor", String(nextScale));
+      }
+
+      async function buildTextLayer(state) {
+        if (state.textLayerBuildPromise) {
+          await state.textLayerBuildPromise;
+          return;
+        }
+        if (state.textLayer) {
+          return;
+        }
+
+        state.textLayerBuildPromise = (async () => {
+        const textContent = await state.page.getTextContent();
+        const viewport = state.page.getViewport({ scale: 1 });
+
+        const layer = document.createElement("div");
+        layer.className = "text-layer";
+        layer.style.width = `${state.baseWidth}px`;
+        layer.style.height = `${state.baseHeight}px`;
+
+        for (const item of textContent.items) {
+          if (!item.str) {
+            continue;
+          }
+
+          const textItemTransform = pdfjsLib.Util.transform(viewport.transform, item.transform);
+          const angle = Math.atan2(textItemTransform[1], textItemTransform[0]);
+          const fontHeight = Math.hypot(textItemTransform[2], textItemTransform[3]);
+          const left = textItemTransform[4];
+          const top = textItemTransform[5];
+
+          const span = document.createElement("span");
+          span.textContent = item.str;
+          span.style.left = `${left}px`;
+          span.style.top = `${top}px`;
+          span.style.fontSize = `${fontHeight}px`;
+
+          const textStyle = textContent.styles[item.fontName];
+          if (textStyle?.fontFamily) {
+            span.style.fontFamily = textStyle.fontFamily;
+          }
+
+          let transform = `translateY(-${fontHeight}px) rotate(${angle}rad)`;
+
+          if (item.width > 0 && textMeasureCtx) {
+            const family = span.style.fontFamily || "sans-serif";
+            textMeasureCtx.font = `${fontHeight}px ${family}`;
+            const measured = textMeasureCtx.measureText(item.str).width;
+            if (measured > 0) {
+              const scaleX = item.width / measured;
+              transform += ` scaleX(${scaleX})`;
+            }
+          }
+
+          span.style.transform = transform;
+          layer.appendChild(span);
+        }
+
+        state.textLayer = layer;
+        })();
+
+        try {
+          await state.textLayerBuildPromise;
+        } finally {
+          state.textLayerBuildPromise = null;
+        }
+      }
+
+      function getVisiblePageRange() {
+        if (!pageStates.length) {
+          return null;
+        }
+
+        const containerRect = viewerContainer.getBoundingClientRect();
+        let first = -1;
+        let last = -1;
+
+        for (let i = 0; i < pageStates.length; i += 1) {
+          const rect = pageStates[i].pageDiv.getBoundingClientRect();
+          const visible = rect.bottom > containerRect.top && rect.top < containerRect.bottom;
+          if (!visible) {
+            continue;
+          }
+          if (first === -1) {
+            first = i;
+          }
+          last = i;
+        }
+
+        if (first === -1 || last === -1) {
+          return null;
+        }
+
+        return {
+          start: Math.max(0, first - TEXT_LAYER_PRELOAD_PAGES),
+          end: Math.min(pageStates.length - 1, last + TEXT_LAYER_PRELOAD_PAGES),
+        };
+      }
+
+      async function refreshTextLayerWindow() {
+        if (!pdfDoc) {
+          return;
+        }
+
+        const range = getVisiblePageRange();
+        if (!range) {
+          return;
+        }
+
+        for (let i = 0; i < pageStates.length; i += 1) {
+          const state = pageStates[i];
+          const inWindow = i >= range.start && i <= range.end;
+
+          if (inWindow) {
+            await buildTextLayer(state);
+            if (state.textLayer && !state.textLayer.isConnected) {
+              state.pageDiv.appendChild(state.textLayer);
+            }
+          } else if (state.textLayer?.isConnected) {
+            state.textLayer.remove();
+          }
+        }
+      }
+
+      function scheduleTextLayerRefresh() {
+        if (textLayerTimer !== null) {
+          clearTimeout(textLayerTimer);
+        }
+        textLayerTimer = window.setTimeout(() => {
+          textLayerTimer = null;
+          void refreshTextLayerWindow();
+        }, TEXT_LAYER_DEBOUNCE_MS);
+      }
+
+      async function loadPdf(file) {
+        setStatus("加载中...");
+        const data = await file.arrayBuffer();
+        const loadingTask = pdfjsLib.getDocument({
+          data,
+          cMapUrl: "./node_modules/pdfjs-dist/cmaps/",
+          cMapPacked: true,
+          standardFontDataUrl: "./node_modules/pdfjs-dist/standard_fonts/",
+        });
+        pdfDoc = await loadingTask.promise;
+
+        pageStates = [];
+        clearViewer();
+
+        for (let i = 1; i <= pdfDoc.numPages; i += 1) {
+          const page = await pdfDoc.getPage(i);
+          const baseViewport = page.getViewport({ scale: 1 });
+
+          const pageDiv = document.createElement("div");
+          pageDiv.className = "page";
+          pageDiv.dataset.pageNumber = String(i);
+          pageDiv.style.setProperty("--scale-round-x", "1px");
+          pageDiv.style.setProperty("--scale-round-y", "1px");
+          setPageDimensions(pageDiv, baseViewport.width, baseViewport.height);
+
+          const wrapper = document.createElement("div");
+          wrapper.className = "canvas-wrapper";
+          pageDiv.appendChild(wrapper);
+          viewer.appendChild(pageDiv);
+
+          pageStates.push({
+            page,
+            pageDiv,
+            wrapper,
+            baseWidth: baseViewport.width,
+            baseHeight: baseViewport.height,
+            baseCanvas: null,
+            detailCanvas: null,
+            textLayer: null,
+            textLayerBuildPromise: null,
+            detailArea: null,
+            lastBaseRenderScale: 0,
+            baseRenderTask: null,
+            detailRenderTask: null,
+          });
+        }
+
+        scale = 1;
+        wheelUnusedFactor = 1;
+        wheelUnusedTicks = 0;
+        setViewerScale(scale);
+        await renderAllPages();
+        refreshDetailView();
+        scheduleTextLayerRefresh();
+        setStatus(`共 ${pdfDoc.numPages} 页 | ${Math.round(scale * 100)}%`);
+      }
+
+      async function renderBaseForPage(state, token) {
+        if (token !== renderToken) {
+          return;
+        }
+
+        const renderScale = clamp(scale, MIN_SCALE, BASE_MAX_RENDER_SCALE);
+        if (Math.abs(state.lastBaseRenderScale - renderScale) < 0.001 && state.baseCanvas) {
+          return;
+        }
+
+        state.baseRenderTask?.cancel();
+
+        const viewport = state.page.getViewport({ scale: renderScale });
+        const outputScale = window.devicePixelRatio || 1;
+
+        const canvas = document.createElement("canvas");
+        canvas.width = Math.max(1, Math.floor(viewport.width * outputScale));
+        canvas.height = Math.max(1, Math.floor(viewport.height * outputScale));
+
+        const context = canvas.getContext("2d", { alpha: false });
+        const transform = outputScale === 1 ? null : [outputScale, 0, 0, outputScale, 0, 0];
+        const task = state.page.render({
+          canvasContext: context,
+          viewport,
+          transform,
+        });
+        state.baseRenderTask = task;
+
+        try {
+          await task.promise;
+        } catch (error) {
+          if (error?.name !== "RenderingCancelledException") {
+            throw error;
+          }
+          return;
+        }
+
+        if (token !== renderToken || state.baseRenderTask !== task) {
+          return;
+        }
+
+        state.baseCanvas?.remove();
+        state.baseCanvas = canvas;
+        state.wrapper.prepend(canvas);
+        state.lastBaseRenderScale = renderScale;
+      }
+
+      async function renderAllPages() {
+        if (!pdfDoc) {
+          return;
+        }
+        const token = ++renderToken;
+
+        for (let i = 0; i < pageStates.length; i += 1) {
+          await renderBaseForPage(pageStates[i], token);
+        }
+
+        if (token === renderToken) {
+          refreshDetailView();
+        }
+      }
+
+      function scheduleRender() {
+        if (drawTimer !== null) {
+          clearTimeout(drawTimer);
+        }
+        drawTimer = window.setTimeout(() => {
+          drawTimer = null;
+          void renderAllPages();
+        }, DEFAULT_DRAWING_DELAY);
+      }
+
+      function getVisibleAreaForPage(state) {
+        const containerRect = viewerContainer.getBoundingClientRect();
+        const pageRect = state.pageDiv.getBoundingClientRect();
+
+        const left = Math.max(containerRect.left, pageRect.left);
+        const top = Math.max(containerRect.top, pageRect.top);
+        const right = Math.min(containerRect.right, pageRect.right);
+        const bottom = Math.min(containerRect.bottom, pageRect.bottom);
+
+        if (right <= left || bottom <= top) {
+          return null;
+        }
+
+        const visibleCssWidth = right - left;
+        const visibleCssHeight = bottom - top;
+        const minX = (left - pageRect.left) / scale;
+        const minY = (top - pageRect.top) / scale;
+        const width = visibleCssWidth / scale;
+        const height = visibleCssHeight / scale;
+
+        return {
+          minX,
+          minY,
+          width,
+          height,
+          maxX: minX + width,
+          maxY: minY + height,
+          visiblePixels: visibleCssWidth * visibleCssHeight,
+        };
+      }
+
+      function pickPrimaryVisiblePage() {
+        let best = null;
+        let bestPixels = 0;
+
+        for (let i = 0; i < pageStates.length; i += 1) {
+          const state = pageStates[i];
+          const area = getVisibleAreaForPage(state);
+          if (!area) {
+            continue;
+          }
+          if (area.visiblePixels > bestPixels) {
+            bestPixels = area.visiblePixels;
+            best = { state, area };
+          }
+        }
+
+        return best;
+      }
+
+      function clearAllDetailCanvas() {
+        pageStates.forEach((state) => {
+          state.detailRenderTask?.cancel();
+          state.detailRenderTask = null;
+          state.detailCanvas?.remove();
+          state.detailCanvas = null;
+          state.detailArea = null;
+        });
+      }
+
+      async function renderDetailCanvas(state, area) {
+        if (!pdfDoc || scale < DETAIL_MIN_SCALE) {
+          return;
+        }
+
+        const overflowScale = 0.35;
+        const minX = Math.max(0, area.minX - area.width * overflowScale);
+        const minY = Math.max(0, area.minY - area.height * overflowScale);
+        const maxX = Math.min(state.baseWidth, area.maxX + area.width * overflowScale);
+        const maxY = Math.min(state.baseHeight, area.maxY + area.height * overflowScale);
+        const detailWidth = maxX - minX;
+        const detailHeight = maxY - minY;
+        if (detailWidth <= 1 || detailHeight <= 1) {
+          return;
+        }
+
+        state.detailRenderTask?.cancel();
+
+        const pixelRatio = window.devicePixelRatio || 1;
+        const viewport = state.page.getViewport({ scale });
+        const canvas = document.createElement("canvas");
+        canvas.className = "detail-view";
+        canvas.width = Math.max(1, Math.floor(detailWidth * scale * pixelRatio));
+        canvas.height = Math.max(1, Math.floor(detailHeight * scale * pixelRatio));
+
+        canvas.style.width = `${(detailWidth * 100) / state.baseWidth}%`;
+        canvas.style.height = `${(detailHeight * 100) / state.baseHeight}%`;
+        canvas.style.left = `${(minX * 100) / state.baseWidth}%`;
+        canvas.style.top = `${(minY * 100) / state.baseHeight}%`;
+
+        const context = canvas.getContext("2d", { alpha: false });
+        const transform = [
+          pixelRatio,
+          0,
+          0,
+          pixelRatio,
+          -minX * scale * pixelRatio,
+          -minY * scale * pixelRatio,
+        ];
+
+        const task = state.page.render({
+          canvasContext: context,
+          viewport,
+          transform,
+        });
+        state.detailRenderTask = task;
+
+        try {
+          await task.promise;
+        } catch (error) {
+          if (error?.name !== "RenderingCancelledException") {
+            throw error;
+          }
+          return;
+        }
+
+        if (state.detailRenderTask !== task) {
+          return;
+        }
+
+        state.detailCanvas?.remove();
+        state.detailCanvas = canvas;
+        state.detailArea = { minX, minY, width: detailWidth, height: detailHeight, scale };
+        state.wrapper.appendChild(canvas);
+      }
+
+      function scheduleDetailRefresh() {
+        if (detailTimer !== null) {
+          clearTimeout(detailTimer);
+        }
+        detailTimer = window.setTimeout(() => {
+          detailTimer = null;
+          refreshDetailView();
+        }, DETAIL_DEBOUNCE_MS);
+      }
+
+      function refreshDetailView() {
+        if (!pdfDoc) {
+          return;
+        }
+        if (scale < DETAIL_MIN_SCALE) {
+          clearAllDetailCanvas();
+          return;
+        }
+
+        const picked = pickPrimaryVisiblePage();
+        if (!picked) {
+          clearAllDetailCanvas();
+          return;
+        }
+
+        pageStates.forEach((state) => {
+          if (state !== picked.state) {
+            state.detailRenderTask?.cancel();
+            state.detailRenderTask = null;
+            state.detailCanvas?.remove();
+            state.detailCanvas = null;
+            state.detailArea = null;
+          }
+        });
+
+        void renderDetailCanvas(picked.state, picked.area);
+      }
+
+      function updateZoomByScaleFactor(scaleFactor, originClientXY, originTarget = null) {
+        if (!pdfDoc) {
+          return;
+        }
+        const prevScale = scale;
+        const nextScale = clamp(prevScale * scaleFactor, MIN_SCALE, MAX_SCALE);
+        if (Math.abs(nextScale - prevScale) < 1e-9) {
+          return;
+        }
+
+        const containerRect = viewerContainer.getBoundingClientRect();
+        const [clientX, clientY] = originClientXY;
+        const originX = clientX - containerRect.left;
+        const originY = clientY - containerRect.top;
+
+        const pointContentBefore = {
+          x: viewerContainer.scrollLeft + originX,
+          y: viewerContainer.scrollTop + originY,
+        };
+
+        let anchorPage = null;
+        for (let i = 0; i < pageStates.length; i += 1) {
+          const state = pageStates[i];
+          const rect = state.wrapper.getBoundingClientRect();
+          if (
+            clientY >= rect.top &&
+            clientY <= rect.bottom
+          ) {
+            const ratioX = rect.width > 0 ? (clientX - rect.left) / rect.width : 0;
+            const ratioY = rect.height > 0 ? (clientY - rect.top) / rect.height : 0;
+            anchorPage = {
+              pageIndex: i,
+              pageNumber: i + 1,
+              ratioX: Math.min(1, Math.max(0, ratioX)),
+              ratioY: Math.min(1, Math.max(0, ratioY)),
+            };
+            break;
+          }
+        }
+
+        const pointPdfAbsBefore = {
+          xCss: pointContentBefore.x,
+          yCss: pointContentBefore.y,
+          xPdf: pointContentBefore.x * 100 / prevScale,
+          yPdf: pointContentBefore.y * 100 / prevScale,
+        };
+
+        const viewOffsetBefore = {
+			vh: viewerContainer.scrollHeight,
+          yCss: viewerContainer.scrollTop,
+		  xPdf: viewerContainer.scrollLeft * 100 / prevScale,
+          yPdf: viewerContainer.scrollTop * 100 / prevScale,
+        };
+
+        scale = nextScale;
+        setViewerScale(scale);
+
+		// 维持鼠标位置不变
+		const contentX = pointPdfAbsBefore.xPdf;
+		const contentY = pointPdfAbsBefore.yPdf;
+
+		if (anchorPage) {
+          const anchorState = pageStates[anchorPage.pageIndex];
+          const afterContainerRect = viewerContainer.getBoundingClientRect();
+          const afterWrapperRect = anchorState.wrapper.getBoundingClientRect();
+          const targetY =
+            viewerContainer.scrollTop +
+            (afterWrapperRect.top - afterContainerRect.top) +
+            afterWrapperRect.height * anchorPage.ratioY;
+
+          // X axis keeps viewer-space compensation (already stable).
+          viewerContainer.scrollLeft = contentX * nextScale / 100 - originX;
+          viewerContainer.scrollTop = targetY - originY;
+        } else {
+		  viewerContainer.scrollLeft = contentX * nextScale / 100 - originX;
+		  viewerContainer.scrollTop = contentY * nextScale / 100 - originY;
+        }
+
+        const viewOffsetAfter = {
+			vh: viewerContainer.scrollHeight,
+          yCss: viewerContainer.scrollTop,
+		  xPdf: viewerContainer.scrollLeft * 100 / prevScale,
+          yPdf: viewerContainer.scrollTop * 100 / nextScale,
+        };
+        const pointPdfAbsAfter = {
+          xCss: viewerContainer.scrollLeft + originX,
+          yCss: viewerContainer.scrollTop + originY,
+          xPdf: (viewerContainer.scrollLeft + originX) * 100 / nextScale,
+          yPdf: (viewerContainer.scrollTop + originY) * 100 / nextScale,
+        };
+
+        console.log("[zoom-debug]", {
+          scaleBefore: prevScale,
+          scaleAfter: nextScale,
+		  mouse: {x:originX, y:originY},
+		  viewOffsetBefore,
+		  viewOffsetAfter,
+		  pointPdfAbsBefore,
+          pointPdfAbsAfter,
+          scrollBefore: { x: pointContentBefore.x - originX, y: pointContentBefore.y - originY },
+          scrollAfter: { x: viewerContainer.scrollLeft, y: viewerContainer.scrollTop },
+          anchorPage,
+          anchorSpace: "viewerContainer",
+        });
+
+        setStatus(`共 ${pdfDoc.numPages} 页 | ${Math.round(scale * 100)}%`);
+        scheduleRender();
+        scheduleDetailRefresh();
+        scheduleTextLayerRefresh();
+      }
+
+      function updateZoomByTicks(ticks, originClientXY, originTarget = null) {
+        if (!ticks) {
+          return;
+        }
+        const DEFAULT_SCALE_DELTA = 1.1;
+        let factor = 1;
+        if (ticks > 0) {
+          factor = Math.pow(DEFAULT_SCALE_DELTA, ticks);
+        } else {
+          factor = Math.pow(1 / DEFAULT_SCALE_DELTA, -ticks);
+        }
+        updateZoomByScaleFactor(factor, originClientXY, originTarget);
+      }
+
+      function onWheel(evt) {
+        if (!pdfDoc) {
+          return;
+        }
+
+        const scaleFactorRaw = Math.exp(-evt.deltaY / 100);
+        const isPinchToZoom =
+          evt.ctrlKey &&
+          evt.deltaMode === WheelEvent.DOM_DELTA_PIXEL &&
+          evt.deltaX === 0 &&
+          Math.abs(scaleFactorRaw - 1) < 0.05 &&
+          evt.deltaZ === 0;
+
+        const allowZoom = isPinchToZoom || evt.ctrlKey || evt.metaKey;
+        if (!allowZoom) {
+          return;
+        }
+
+        evt.preventDefault();
+        const origin = [evt.clientX, evt.clientY];
+
+        if (isPinchToZoom) {
+          const factor = accumulateFactor(scale, scaleFactorRaw);
+          updateZoomByScaleFactor(factor, origin, evt.target);
+          return;
+        }
+
+        const delta = normalizeWheelEventDirection(evt);
+        let ticks = 0;
+        if (evt.deltaMode === WheelEvent.DOM_DELTA_LINE || evt.deltaMode === WheelEvent.DOM_DELTA_PAGE) {
+          ticks = Math.abs(delta) >= 1 ? Math.sign(delta) : accumulateTicks(delta);
+        } else {
+          ticks = accumulateTicks(delta / PIXELS_PER_LINE_SCALE);
+        }
+        updateZoomByTicks(ticks, origin, evt.target);
+      }
+
+      openBtn.addEventListener("click", () => {
+        fileInput.click();
+      });
+
+      fileInput.addEventListener("change", async () => {
+        const file = fileInput.files?.[0];
+        if (!file) {
+          return;
+        }
+        try {
+          await loadPdf(file);
+        } catch (error) {
+          console.error(error);
+          setStatus("加载失败，请检查文件");
+        }
+      });
+
+      viewerContainer.addEventListener("wheel", onWheel, { passive: false });
+      viewerContainer.addEventListener("scroll", scheduleDetailRefresh, { passive: true });
+      viewerContainer.addEventListener("scroll", scheduleTextLayerRefresh, { passive: true });
+    </script>
+  </body>
+</html>

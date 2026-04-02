@@ -1,0 +1,13 @@
+.pdfjs-container .pdfViewer {
+
+	display: grid;
+	justify-items: center;
+}
+
+.pdfjs-container .page {
+  box-sizing: content-box;
+}
+
+.pdfjs-container .page .annotationLayer .linkAnnotation {
+	display: none;
+}
