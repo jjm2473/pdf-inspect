@@ -13,8 +13,8 @@ import {
 import * as pdfjsLib from 'pdfjs-dist'
 import type {
   PDFFindController,
+  PDFLinkService,
   PDFViewer,
-  SimpleLinkService,
 } from 'pdfjs-dist/web/pdf_viewer.mjs'
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url'
 import 'pdfjs-dist/web/pdf_viewer.css'
@@ -23,8 +23,17 @@ import './PdfJsViewer.css'
 type PdfJsViewerProps = {
   fileData: Uint8Array | null
   onError?: (message: string) => void
+  onLoadingChange?: (loading: boolean) => void
+  onLoadingProgress?: (loaded: number, total: number | null) => void
   onPageChange?: (pageNumber: number, totalPages: number) => void
   onScaleChange?: (scale: number) => void
+}
+
+export type PdfSearchResult = {
+  id: string
+  page: number
+  matchIndex: number
+  text: string
 }
 
 export type PdfJsViewerHandle = {
@@ -39,12 +48,18 @@ export type PdfJsViewerHandle = {
     query: string,
     options?: {
       caseSensitive?: boolean
-      entireWord?: boolean
     },
   ) => void
   findNext: () => void
   findPrevious: () => void
   clearFind: () => void
+  searchAll: (
+    query: string,
+    options?: {
+      caseSensitive?: boolean
+    },
+  ) => Promise<PdfSearchResult[]>
+  focusSearchResult: (result: PdfSearchResult) => Promise<void>
 }
 
 type ViewerWithNullableSetDocument = PDFViewer & {
@@ -102,17 +117,87 @@ function accumulateFactor(
   return newFactor
 }
 
+function sleep(ms: number) {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, ms)
+  })
+}
+
+function collectHighlightGroups(textLayer: Element) {
+  const nodes = Array.from(textLayer.querySelectorAll('.highlight')) as HTMLElement[]
+  const groups: HTMLElement[][] = []
+
+  for (const node of nodes) {
+    const isMiddle = node.classList.contains('middle')
+    const isEnd = node.classList.contains('end')
+    if (!isMiddle && !isEnd) {
+      groups.push([node])
+      continue
+    }
+    if (groups.length === 0) {
+      continue
+    }
+    groups[groups.length - 1].push(node)
+  }
+
+  return groups
+}
+
+function buildSnippet(content: string, start: number, length: number) {
+  const from = Math.max(0, start - 18)
+  const to = Math.min(content.length, start + length + 26)
+  const head = from > 0 ? '...' : ''
+  const tail = to < content.length ? '...' : ''
+  return `${head}${content.slice(from, to)}${tail}`.replace(/\s+/g, ' ').trim()
+}
+
+function toNormalizedIndex(
+  diffs: [Uint32Array, Int32Array] | null | undefined,
+  originalPos: number,
+) {
+  if (!diffs) {
+    return originalPos
+  }
+
+  const [starts, shifts] = diffs
+  const last = starts.length - 1
+
+  for (let i = 0; i < last; i += 1) {
+    const normStart = starts[i]
+    const normEnd = starts[i + 1] - 1
+    const shift = shifts[i]
+    const oldStart = normStart + shift
+    const oldEnd = normEnd + shift
+
+    if (originalPos >= oldStart && originalPos <= oldEnd) {
+      return originalPos - shift
+    }
+    if (originalPos < oldStart) {
+      return normStart
+    }
+  }
+
+  return originalPos - shifts[last]
+}
+
 GlobalWorkerOptions.workerSrc = pdfWorkerUrl
 
 const PdfJsViewer = forwardRef<PdfJsViewerHandle, PdfJsViewerProps>(
   function PdfJsViewer(
-    { fileData, onError, onPageChange, onScaleChange }: PdfJsViewerProps,
+    {
+      fileData,
+      onError,
+      onLoadingChange,
+      onLoadingProgress,
+      onPageChange,
+      onScaleChange,
+    }: PdfJsViewerProps,
     ref,
   ) {
   const containerRef = useRef<HTMLDivElement | null>(null)
   const viewerRef = useRef<HTMLDivElement | null>(null)
   const pdfViewerRef = useRef<PDFViewer | null>(null)
-  const linkServiceRef = useRef<SimpleLinkService | null>(null)
+  const linkServiceRef = useRef<PDFLinkService | null>(null)
   const findControllerRef = useRef<PDFFindController | null>(null)
   const eventBusRef = useRef<
     | {
@@ -131,7 +216,6 @@ const PdfJsViewer = forwardRef<PdfJsViewerHandle, PdfJsViewerProps>(
   const findStateRef = useRef({
     query: '',
     caseSensitive: false,
-    entireWord: false,
   })
 
   useImperativeHandle(ref, () => ({
@@ -166,7 +250,7 @@ const PdfJsViewer = forwardRef<PdfJsViewerHandle, PdfJsViewerProps>(
     },
     find: (
       query: string,
-      options: { caseSensitive?: boolean; entireWord?: boolean } = {},
+      options: { caseSensitive?: boolean } = {},
     ) => {
       const eventBus = eventBusRef.current
       if (!eventBus) {
@@ -174,8 +258,7 @@ const PdfJsViewer = forwardRef<PdfJsViewerHandle, PdfJsViewerProps>(
       }
 
       const caseSensitive = options.caseSensitive ?? false
-      const entireWord = options.entireWord ?? false
-      findStateRef.current = { query, caseSensitive, entireWord }
+      findStateRef.current = { query, caseSensitive }
 
       eventBus.dispatch('find', {
         source: 'pdf-inspect',
@@ -183,7 +266,7 @@ const PdfJsViewer = forwardRef<PdfJsViewerHandle, PdfJsViewerProps>(
         query,
         phraseSearch: true,
         caseSensitive,
-        entireWord,
+        entireWord: false,
         highlightAll: true,
         findPrevious: false,
         matchDiacritics: false,
@@ -201,7 +284,7 @@ const PdfJsViewer = forwardRef<PdfJsViewerHandle, PdfJsViewerProps>(
         query: findStateRef.current.query,
         phraseSearch: true,
         caseSensitive: findStateRef.current.caseSensitive,
-        entireWord: findStateRef.current.entireWord,
+        entireWord: false,
         highlightAll: true,
         findPrevious: false,
         matchDiacritics: false,
@@ -219,7 +302,7 @@ const PdfJsViewer = forwardRef<PdfJsViewerHandle, PdfJsViewerProps>(
         query: findStateRef.current.query,
         phraseSearch: true,
         caseSensitive: findStateRef.current.caseSensitive,
-        entireWord: findStateRef.current.entireWord,
+        entireWord: false,
         highlightAll: true,
         findPrevious: true,
         matchDiacritics: false,
@@ -234,7 +317,6 @@ const PdfJsViewer = forwardRef<PdfJsViewerHandle, PdfJsViewerProps>(
       findStateRef.current = {
         query: '',
         caseSensitive: false,
-        entireWord: false,
       }
       eventBus.dispatch('find', {
         source: 'pdf-inspect',
@@ -247,6 +329,120 @@ const PdfJsViewer = forwardRef<PdfJsViewerHandle, PdfJsViewerProps>(
         findPrevious: false,
         matchDiacritics: false,
       })
+    },
+    searchAll: async (
+      query: string,
+      options: { caseSensitive?: boolean } = {},
+    ) => {
+      const eventBus = eventBusRef.current
+      const findController = findControllerRef.current
+      if (!eventBus || !findController) {
+        return []
+      }
+
+      const caseSensitive = options.caseSensitive ?? false
+      findStateRef.current = { query, caseSensitive }
+
+      eventBus.dispatch('find', {
+        source: 'pdf-inspect',
+        type: 'again',
+        query,
+        phraseSearch: true,
+        caseSensitive,
+        entireWord: false,
+        highlightAll: true,
+        findPrevious: false,
+        matchDiacritics: false,
+      })
+
+      const internal = findController as unknown as {
+        _extractTextPromises?: Array<Promise<void>>
+        _pendingFindMatches?: Set<number>
+        _pageContents?: string[]
+        _pageDiffs?: Array<[Uint32Array, Int32Array] | null>
+      }
+
+      // In PDF.js, plain find requests are delayed by FIND_TIMEOUT.
+      // Wait one tick-window to ensure extraction/matching has started.
+      await sleep(280)
+
+      const textPromises = internal._extractTextPromises ?? []
+      if (textPromises.length > 0) {
+        await Promise.all(textPromises)
+      }
+
+      for (let attempt = 0; attempt < 120; attempt += 1) {
+        const pendingSize = internal._pendingFindMatches?.size ?? 0
+        if (pendingSize === 0) {
+          break
+        }
+        await sleep(16)
+      }
+
+      const pageMatches = findController.pageMatches ?? []
+      const pageMatchesLength = findController.pageMatchesLength ?? []
+      const pageContents = internal._pageContents ?? []
+      const pageDiffs = internal._pageDiffs ?? []
+      const results: PdfSearchResult[] = []
+
+      for (let pageIdx = 0; pageIdx < pageMatches.length; pageIdx += 1) {
+        const matches = pageMatches[pageIdx] ?? []
+        const lengths = pageMatchesLength[pageIdx] ?? []
+        const content = pageContents[pageIdx] ?? ''
+        const diffs = pageDiffs[pageIdx]
+        for (let matchIdx = 0; matchIdx < matches.length; matchIdx += 1) {
+          const start = matches[matchIdx] ?? 0
+          const length = lengths[matchIdx] ?? query.length
+          const normalizedStart = toNormalizedIndex(diffs, start)
+          const snippetStart = Math.max(0, normalizedStart)
+          results.push({
+            id: `p${pageIdx + 1}-m${matchIdx}`,
+            page: pageIdx + 1,
+            matchIndex: matchIdx,
+            text: buildSnippet(content, snippetStart, query.length || length),
+          })
+        }
+      }
+
+      return results
+    },
+    focusSearchResult: async (result: PdfSearchResult) => {
+      const viewer = pdfViewerRef.current
+      const container = containerRef.current
+      if (!viewer || !container) {
+        return
+      }
+
+      const isSamePage = viewer.currentPageNumber === result.page
+      if (!isSamePage) {
+        viewer.currentPageNumber = result.page
+      }
+      for (let attempt = 0; attempt < 24; attempt += 1) {
+        await sleep(16)
+        const page = container.querySelector(
+          `.page[data-page-number="${result.page}"] .textLayer`,
+        )
+        if (!page) {
+          continue
+        }
+        const groups = collectHighlightGroups(page)
+        const targetGroup = groups[result.matchIndex]
+        const target = targetGroup?.[0]
+        if (target) {
+          for (const selected of page.querySelectorAll('.highlight.selected')) {
+            selected.classList.remove('selected')
+          }
+          for (const node of targetGroup) {
+            node.classList.add('selected')
+          }
+          target.scrollIntoView({
+            block: 'center',
+            inline: 'center',
+            behavior: isSamePage ? 'smooth' : 'auto',
+          })
+          break
+        }
+      }
     },
   }), [])
 
@@ -261,7 +457,7 @@ const PdfJsViewer = forwardRef<PdfJsViewerHandle, PdfJsViewerProps>(
     initPromiseRef.current = (async () => {
       ;(globalThis as { pdfjsLib?: unknown }).pdfjsLib = pdfjsLib
 
-      const { EventBus, PDFFindController, PDFViewer, SimpleLinkService } = await import(
+      const { EventBus, PDFFindController, PDFLinkService, PDFViewer } = await import(
         'pdfjs-dist/web/pdf_viewer.mjs'
       )
       if (disposed) {
@@ -269,7 +465,7 @@ const PdfJsViewer = forwardRef<PdfJsViewerHandle, PdfJsViewerProps>(
       }
 
       const eventBus = new EventBus()
-      const linkService = new SimpleLinkService()
+      const linkService = new PDFLinkService({ eventBus })
       const findController = new PDFFindController({
         eventBus,
         linkService,
@@ -315,7 +511,7 @@ const PdfJsViewer = forwardRef<PdfJsViewerHandle, PdfJsViewerProps>(
         const rect = container.getBoundingClientRect()
         const cursorLeft = event.clientX - rect.left
         const cursorTop = event.clientY - rect.top
-		const origin = [cursorLeft, cursorTop]
+        const origin = [cursorLeft, cursorTop]
 
         if (isPinchToZoom) {
           scaleFactor = accumulateFactor(
@@ -502,9 +698,12 @@ const PdfJsViewer = forwardRef<PdfJsViewerHandle, PdfJsViewerProps>(
       setFindDocument(findController, null)
 
       if (!fileData) {
+        onLoadingChange?.(false)
         onError?.('')
         return
       }
+
+      onLoadingChange?.(true)
 
       loadingTask = getDocument({
         data: fileData,
@@ -512,6 +711,9 @@ const PdfJsViewer = forwardRef<PdfJsViewerHandle, PdfJsViewerProps>(
         cMapPacked: true,
         standardFontDataUrl: '/pdfjs/standard_fonts/',
       })
+      loadingTask.onProgress = ({ loaded, total }: { loaded: number; total?: number }) => {
+        onLoadingProgress?.(loaded, total ?? null)
+      }
 
       const pdfDoc = await loadingTask.promise
       if (disposed) {
@@ -531,6 +733,7 @@ const PdfJsViewer = forwardRef<PdfJsViewerHandle, PdfJsViewerProps>(
       onPageChange?.(pdfViewer.currentPageNumber, pdfViewer.pagesCount)
       onScaleChange?.(pdfViewer.currentScale)
       onError?.('')
+      onLoadingChange?.(false)
     }
 
     open().catch((error) => {
@@ -540,6 +743,7 @@ const PdfJsViewer = forwardRef<PdfJsViewerHandle, PdfJsViewerProps>(
           : '加载 PDF 失败'
       console.error('[PdfJsViewer] open failed', error)
       onError?.(message)
+      onLoadingChange?.(false)
     })
 
     return () => {
@@ -558,6 +762,7 @@ const PdfJsViewer = forwardRef<PdfJsViewerHandle, PdfJsViewerProps>(
       if (findController) {
         setFindDocument(findController, null)
       }
+      onLoadingChange?.(false)
     }
   }, [fileData])
 

@@ -11,3 +11,7 @@
 .pdfjs-container .page .annotationLayer .linkAnnotation {
 	display: none;
 }
+
+.pdfjs-container .page .annotationLayer .linkAnnotation[data-internal-link] {
+	display: initial;
+}

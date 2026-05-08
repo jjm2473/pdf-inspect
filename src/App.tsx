@@ -1,46 +1,98 @@
 import { useEffect, useMemo, useRef, useState, type ChangeEvent } from 'react'
-import { getDocument } from 'pdfjs-dist'
-import PdfJsViewer, { type PdfJsViewerHandle } from './PdfJsViewer'
-import { analyzePdfDocument } from './pdfAnalysis'
-import type { ElementRecord } from './types'
+import PdfJsViewer, {
+  type PdfJsViewerHandle,
+  type PdfSearchResult,
+} from './PdfJsViewer'
 import './App.css'
-
-type AnalysisStatus = 'idle' | 'running' | 'ready' | 'error'
 
 export default function App() {
   const [fileName, setFileName] = useState('未打开文件')
   const [fileData, setFileData] = useState<Uint8Array | null>(null)
   const [error, setError] = useState('')
+  const [isFileReading, setIsFileReading] = useState(false)
+  const [isPdfLoading, setIsPdfLoading] = useState(false)
+  const [pdfLoadProgress, setPdfLoadProgress] = useState<{ loaded: number; total: number | null }>({
+    loaded: 0,
+    total: null,
+  })
 
   const [pageNumber, setPageNumber] = useState(1)
   const [totalPages, setTotalPages] = useState(0)
   const [scale, setScale] = useState(1)
-
-  const [analysisStatus, setAnalysisStatus] = useState<AnalysisStatus>('idle')
-  const [analysisProgress, setAnalysisProgress] = useState('')
-  const [elementsByPage, setElementsByPage] = useState<
-    Record<number, ElementRecord[]>
-  >({})
-  const [selectedId, setSelectedId] = useState<string | null>(null)
+  const [pageInput, setPageInput] = useState('1')
 
   const [searchQuery, setSearchQuery] = useState('')
   const [caseSensitive, setCaseSensitive] = useState(false)
-  const [entireWord, setEntireWord] = useState(false)
   const [searchMessage, setSearchMessage] = useState('')
+  const [searchResults, setSearchResults] = useState<PdfSearchResult[]>([])
+  const [selectedResultId, setSelectedResultId] = useState<string | null>(null)
+  const [activeQuery, setActiveQuery] = useState('')
+  const [activeCaseSensitive, setActiveCaseSensitive] = useState(false)
 
   const viewerRef = useRef<PdfJsViewerHandle | null>(null)
+  const viewerSurfaceRef = useRef<HTMLDivElement | null>(null)
   const searchInputRef = useRef<HTMLInputElement | null>(null)
+  const currentPageResultCount = useMemo(
+    () => searchResults.filter((item) => item.page === pageNumber).length,
+    [searchResults, pageNumber],
+  )
+  const groupedSearchResults = useMemo(() => {
+    const groups = new Map<number, PdfSearchResult[]>()
+    for (const result of searchResults) {
+      const list = groups.get(result.page)
+      if (list) {
+        list.push(result)
+      } else {
+        groups.set(result.page, [result])
+      }
+    }
+    return Array.from(groups.entries())
+      .sort((a, b) => a[0] - b[0])
+      .map(([page, results]) => ({ page, results }))
+  }, [searchResults])
 
-  const allElements = useMemo(
-    () => Object.values(elementsByPage).flat(),
-    [elementsByPage],
-  )
-  const elementIndex = useMemo(
-    () => new Map(allElements.map((item) => [item.id, item] as const)),
-    [allElements],
-  )
-  const currentPageElements = elementsByPage[pageNumber] ?? []
-  const selectedElement = selectedId ? (elementIndex.get(selectedId) ?? null) : null
+  const loadingLabel = useMemo(() => {
+    if (isFileReading) {
+      return '正在读取文件...'
+    }
+    if (!isPdfLoading) {
+      return ''
+    }
+    const { loaded, total } = pdfLoadProgress
+    if (total && total > 0) {
+      const percent = Math.min(100, Math.round((loaded / total) * 100))
+      return `正在解析 PDF ${percent}%`
+    }
+    return '正在解析 PDF...'
+  }, [isFileReading, isPdfLoading, pdfLoadProgress])
+  const isLoading = isFileReading || isPdfLoading
+
+  useEffect(() => {
+    setPageInput(String(pageNumber))
+  }, [pageNumber])
+
+  const commitPageInput = () => {
+    if (!fileData || totalPages <= 0) {
+      setPageInput(String(pageNumber))
+      return
+    }
+
+    const trimmed = pageInput.trim()
+    if (!trimmed) {
+      setPageInput(String(pageNumber))
+      return
+    }
+
+    const parsed = Number(trimmed)
+    if (!Number.isFinite(parsed)) {
+      setPageInput(String(pageNumber))
+      return
+    }
+
+    const nextPage = Math.min(totalPages, Math.max(1, Math.round(parsed)))
+    setPageInput(String(nextPage))
+    viewerRef.current?.goToPage(nextPage)
+  }
 
   const handleOpenPdf = async (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0]
@@ -49,6 +101,13 @@ export default function App() {
     }
 
     try {
+      setIsFileReading(true)
+      setIsPdfLoading(true)
+      setPdfLoadProgress({ loaded: 0, total: null })
+      await new Promise<void>((resolve) => {
+        window.requestAnimationFrame(() => resolve())
+      })
+
       const data = new Uint8Array(await file.arrayBuffer())
       setFileData(data)
       setFileName(file.name)
@@ -56,68 +115,121 @@ export default function App() {
       setPageNumber(1)
       setTotalPages(0)
       setScale(1)
-      setElementsByPage({})
-      setSelectedId(null)
-      setAnalysisStatus('idle')
-      setAnalysisProgress('')
+      setSearchResults([])
+      setSelectedResultId(null)
       setSearchMessage('')
+      setActiveQuery('')
     } catch {
       setError('文件读取失败，请重试。')
+      setIsPdfLoading(false)
     } finally {
+      setIsFileReading(false)
       event.target.value = ''
     }
   }
 
-  // @ts-ignore
-  const analyzeData = async (data: Uint8Array) => {
-    if (analysisStatus === 'running') {
-      return
-    }
-
-    setAnalysisStatus('running')
-    setError('')
-    setAnalysisProgress('')
-
-    try {
-      const loadingTask = getDocument({ data })
-      const doc = await loadingTask.promise
-      const result = await analyzePdfDocument(doc, (current, total) => {
-        setAnalysisProgress(`分析中 ${current}/${total}`)
-      })
-      await doc.destroy()
-
-      setElementsByPage(result.elementsByPage)
-      setAnalysisStatus('ready')
-      setAnalysisProgress(`分析完成，共 ${result.totalElements} 个元素`)
-    } catch {
-      setAnalysisStatus('error')
-      setAnalysisProgress('')
-      setError('分析失败，请重试或更换 PDF 文件。')
-    }
-  }
-
-  useEffect(() => {
-    if (!fileData) {
-      return
-    }
-    //void analyzeData(fileData)
-  }, [fileData])
-
-  const jumpToElement = (element: ElementRecord) => {
-    viewerRef.current?.goToPage(element.page)
-    setSelectedId(element.id)
-  }
-
-  const runSearch = () => {
+  const runSearch = async () => {
     const query = searchQuery.trim()
     if (!query) {
       setSearchMessage('请输入搜索内容。')
       viewerRef.current?.clearFind()
+      setSearchResults([])
+      setSelectedResultId(null)
       return
     }
 
-    viewerRef.current?.find(query, { caseSensitive, entireWord })
-    setSearchMessage(`已执行文本搜索: ${query}`)
+    const results = await viewerRef.current?.searchAll(query, {
+      caseSensitive,
+    })
+    const nextResults = results ?? []
+    setSearchResults(nextResults)
+    setSelectedResultId(null)
+    setActiveQuery(query)
+    setActiveCaseSensitive(caseSensitive)
+    setSearchMessage(`命中 ${nextResults.length} 项`)
+  }
+
+  const renderHighlightedSnippet = (snippet: string) => {
+    if (!snippet) {
+      return '(空文本片段)'
+    }
+
+    const cropSnippet = (text: string, query: string, maxLength: number) => {
+      if (text.length <= maxLength) {
+        return text
+      }
+
+      if (!query) {
+        return `${text.slice(0, maxLength - 1)}…`
+      }
+
+      const source = activeCaseSensitive ? text : text.toLocaleLowerCase()
+      const target = activeCaseSensitive ? query : query.toLocaleLowerCase()
+      const hitStart = source.indexOf(target)
+
+      if (hitStart < 0) {
+        return `${text.slice(0, maxLength - 1)}…`
+      }
+
+      const hitLength = query.length
+      let from = Math.max(0, hitStart - Math.floor((maxLength - hitLength) / 2))
+      let to = Math.min(text.length, from + maxLength)
+      from = Math.max(0, to - maxLength)
+
+      let clipped = text.slice(from, to)
+      if (from > 0) {
+        clipped = `…${clipped.slice(1)}`
+      }
+      if (to < text.length) {
+        clipped = `${clipped.slice(0, -1)}…`
+      }
+      return clipped
+    }
+
+	const query = activeQuery.trim()
+	const queryLength = query.length
+    const displaySnippet = cropSnippet(snippet, query, Math.max(37, queryLength + 2))
+
+    if (!query) {
+      return displaySnippet
+    }
+
+    const escapedQuery = query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const flags = activeCaseSensitive ? 'g' : 'gi'
+    const matcher = new RegExp(escapedQuery, flags)
+    const parts = displaySnippet.split(matcher)
+    const hits = displaySnippet.match(matcher) ?? []
+
+    return (
+      <>
+        {parts.map((part, index) => (
+          <span key={`p-${index}`}>
+            {part}
+            {hits[index] ? <mark className="snippet-hit">{hits[index]}</mark> : null}
+          </span>
+        ))}
+      </>
+    )
+  }
+
+  const focusResult = async (result: PdfSearchResult) => {
+    setSelectedResultId(result.id)
+    await viewerRef.current?.focusSearchResult(result)
+  }
+
+  const jumpToPageStart = (targetPage: number) => {
+    setSelectedResultId(null)
+    viewerRef.current?.goToPage(targetPage)
+  }
+
+  const clearSearch = () => {
+    setSearchQuery('')
+    setSearchMessage('')
+    setSearchResults([])
+    setSelectedResultId(null)
+    setActiveQuery('')
+    viewerRef.current?.clearFind()
+    searchInputRef.current?.focus()
   }
 
   useEffect(() => {
@@ -125,6 +237,21 @@ export default function App() {
       const key = event.key.toLowerCase()
       if ((event.metaKey || event.ctrlKey) && key === 'f') {
         event.preventDefault()
+
+        const selection = window.getSelection()
+        const selectedText = selection?.toString().trim() ?? ''
+        const range = selection && selection.rangeCount > 0 ? selection.getRangeAt(0) : null
+        const commonNode = range?.commonAncestorContainer ?? null
+        const surface = viewerSurfaceRef.current
+        const selectedInViewer =
+          !!surface &&
+          !!commonNode &&
+          surface.contains(commonNode.nodeType === Node.TEXT_NODE ? commonNode.parentNode : commonNode)
+
+        if (selectedInViewer && selectedText) {
+          setSearchQuery(selectedText)
+        }
+
         window.requestAnimationFrame(() => {
           searchInputRef.current?.focus()
           searchInputRef.current?.select()
@@ -147,9 +274,6 @@ export default function App() {
 
         <div className="status-row">
           <span className="file-pill">文件: {fileName}</span>
-          <span>页码: {pageNumber}/{totalPages || '-'}</span>
-          <span>缩放: {Math.round(scale * 100)}%</span>
-          <span>{analysisProgress || '分析待完成'}</span>
           {error ? <span className="status-error">{error}</span> : null}
         </div>
 
@@ -167,57 +291,32 @@ export default function App() {
       </header>
 
       <main className="layout">
-        <aside className="panel left-panel">
-          <h2>元素详情</h2>
-          {selectedElement ? (
-            <div className="details-grid">
-              <div>
-                <strong>ID</strong>
-                <p>{selectedElement.id}</p>
-              </div>
-              <div>
-                <strong>类型</strong>
-                <p>{selectedElement.type}</p>
-              </div>
-              <div>
-                <strong>页码</strong>
-                <p>{selectedElement.page}</p>
-              </div>
-              <div>
-                <strong>文本</strong>
-                <p>{selectedElement.displayText || '无'}</p>
-              </div>
-              <div>
-                <strong>标签</strong>
-                <p>{selectedElement.tags.join(', ') || '无'}</p>
-              </div>
-              <div>
-                <strong>属性</strong>
-                <p>{JSON.stringify(selectedElement.rawAttrs)}</p>
-              </div>
-            </div>
-          ) : (
-            <p className="empty-tip">点击下方元素列表项后查看详情。</p>
-          )}
-
-          <h2>当前页元素</h2>
-          <ul className="search-results">
-            {currentPageElements.slice(0, 80).map((element) => (
-              <li key={element.id}>
-                <button type="button" onClick={() => jumpToElement(element)}>
-                  <span className="result-title">P{element.page} · {element.type}</span>
-                  <span className="result-summary">{element.displayText || element.id}</span>
-                </button>
-              </li>
-            ))}
-          </ul>
-        </aside>
-
         <section className="viewer-panel">
           <div className="viewer-toolbar">
             <button type="button" onClick={() => viewerRef.current?.prevPage()} disabled={!fileData}>
               上一页
             </button>
+            <span className="page-input-group">
+              <input
+                id="page-number-input"
+                type="text"
+                inputMode="numeric"
+                pattern="[0-9]*"
+                value={pageInput}
+                onChange={(event) => {
+                  setPageInput(event.target.value)
+                }}
+                onBlur={commitPageInput}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter') {
+                    event.preventDefault()
+                    commitPageInput()
+                  }
+                }}
+                aria-label="页码输入"
+              />
+              <span>/ {totalPages || '-'}</span>
+            </span>
             <button type="button" onClick={() => viewerRef.current?.nextPage()} disabled={!fileData}>
               下一页
             </button>
@@ -240,19 +339,36 @@ export default function App() {
             </label>
 
             <span>{Math.round(scale * 100)}%</span>
+            
+            <span>当前页命中: {currentPageResultCount}</span>
           </div>
 
-          <div className="viewer-surface">
+          <div ref={viewerSurfaceRef} className="viewer-surface">
             <PdfJsViewer
               ref={viewerRef}
               fileData={fileData}
               onError={setError}
+              onLoadingChange={(loading) => {
+                setIsPdfLoading(loading)
+                if (!loading) {
+                  setPdfLoadProgress({ loaded: 0, total: null })
+                }
+              }}
+              onLoadingProgress={(loaded, total) => {
+                setPdfLoadProgress({ loaded, total })
+              }}
               onPageChange={(page, total) => {
                 setPageNumber(page)
                 setTotalPages(total)
               }}
               onScaleChange={(value) => setScale(value)}
             />
+            {isLoading ? (
+              <div className="viewer-loading" role="status" aria-live="polite" aria-label={loadingLabel || '加载中'}>
+                <span className="viewer-loading-spinner" aria-hidden="true" />
+                <span>{loadingLabel || '加载中...'}</span>
+              </div>
+            ) : null}
           </div>
 
           {!fileData ? <p className="empty-tip">请选择 PDF 文件后开始。</p> : null}
@@ -260,23 +376,38 @@ export default function App() {
 
         <aside className="panel right-panel">
           <h2>文本搜索</h2>
-          <label htmlFor="search-input" className="search-label">
-            使用官方文本层搜索（Cmd/Ctrl+F 聚焦）
-          </label>
-          <input
-            id="search-input"
-            type="search"
-            ref={searchInputRef}
-            value={searchQuery}
-            onChange={(event) => setSearchQuery(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === 'Enter') {
-                event.preventDefault()
-                runSearch()
-              }
+          <form
+            onSubmit={(event) => {
+              event.preventDefault()
+              void runSearch()
             }}
-            placeholder="输入关键字并回车"
-          />
+          >
+            <label htmlFor="search-input" className="search-label">
+              搜索（Cmd/Ctrl+F 聚焦）
+            </label>
+            <div className="search-input-wrap">
+              <input
+                id="search-input"
+                name="pdf_search"
+                type="text"
+                autoComplete="on"
+                ref={searchInputRef}
+                value={searchQuery}
+                onChange={(event) => setSearchQuery(event.target.value)}
+                placeholder="输入关键字并回车"
+              />
+              {searchQuery ? (
+                <button
+                  type="button"
+                  className="search-clear"
+                  aria-label="清空搜索词"
+                  onClick={clearSearch}
+                >
+                  ×
+                </button>
+              ) : null}
+            </div>
+          </form>
 
           <label className="regex-toggle" htmlFor="case-sensitive">
             <input
@@ -288,34 +419,38 @@ export default function App() {
             区分大小写
           </label>
 
-          <label className="regex-toggle" htmlFor="entire-word">
-            <input
-              id="entire-word"
-              type="checkbox"
-              checked={entireWord}
-              onChange={(event) => setEntireWord(event.target.checked)}
-            />
-            整词匹配
-          </label>
+          <ul className="search-results">
+            {groupedSearchResults.map((group) => (
+              <li key={`group-${group.page}`} className="search-group">
+                <button
+                  type="button"
+                  className="search-group-title"
+                  onClick={() => {
+                    jumpToPageStart(group.page)
+                  }}
+                >
+                  第 {group.page} 页 · {group.results.length} 项
+                </button>
 
-          <div className="search-actions">
-            <button type="button" onClick={() => viewerRef.current?.findPrevious()}>
-              上一个
-            </button>
-            <button type="button" onClick={() => viewerRef.current?.findNext()}>
-              下一个
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                setSearchQuery('')
-                setSearchMessage('')
-                viewerRef.current?.clearFind()
-              }}
-            >
-              清空
-            </button>
-          </div>
+                <ul className="search-group-items">
+                  {group.results.map((result) => (
+                    <li key={result.id}>
+                      <button
+                        type="button"
+                        className={selectedResultId === result.id ? 'is-active' : ''}
+                        onClick={() => {
+                          void focusResult(result)
+                        }}
+                      >
+                        <span className="result-title">#{result.matchIndex + 1}</span>
+                        <span className="result-summary">{renderHighlightedSnippet(result.text)}</span>
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              </li>
+            ))}
+          </ul>
 
           <p className="search-message">{searchMessage || '在输入框按回车触发搜索。'}</p>
         </aside>
