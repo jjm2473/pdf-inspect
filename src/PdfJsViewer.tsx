@@ -707,9 +707,9 @@ const PdfJsViewer = forwardRef<PdfJsViewerHandle, PdfJsViewerProps>(
 
       loadingTask = getDocument({
         data: fileData,
-        cMapUrl: '/pdfjs/cmaps/',
+        cMapUrl: `${import.meta.env.BASE_URL}pdfjs/cmaps/`,
         cMapPacked: true,
-        standardFontDataUrl: '/pdfjs/standard_fonts/',
+        standardFontDataUrl: `${import.meta.env.BASE_URL}pdfjs/standard_fonts/`,
       })
       loadingTask.onProgress = ({ loaded, total }: { loaded: number; total?: number }) => {
         onLoadingProgress?.(loaded, total ?? null)
